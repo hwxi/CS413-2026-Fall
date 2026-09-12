@@ -13,3 +13,10 @@ Everything you submit should stay in the MySolution directory
 The purpose of this assignment is to gain practical experience with
 abstract syntax trees (ASTs), which are used everywhere in compiler
 construction.
+
+As always, this assignment emphasizes that AI-generated code should be
+treated as a draft that must be reviewed, tested, and corrected by the
+programmer.
+
+## Tasks
+
