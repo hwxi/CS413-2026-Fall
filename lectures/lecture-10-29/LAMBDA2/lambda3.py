@@ -1135,22 +1135,64 @@ def d0cls_typecheck(declarations: fnlist[d0cls]) -> None:
 
 
 ########################################################################
-# Python code generation.  The compiler follows the register-based
-# compilation structure in CS391-2026-Summer/lambda4.py: each expression
-# compiles to a result register and an ordered instruction list.  Python's
-# nested functions provide the closure behavior for lam and fix.
+# Python code generation.  Each expression is lowered to an ordered block of
+# Python statements plus the name of the register holding its value.  These
+# registers are ordinary local variables (not VM registers): naming them
+# explicitly makes evaluation order and intermediate results visible in the
+# generated source.  The compiler follows the register-based compilation
+# structure in CS391-2026-Summer/lambda4.py.  Lexical environments map source
+# names to these Python locals, while Python nested functions capture locals
+# to implement lam and fix.
 ########################################################################
+
+@dataclass(frozen=True)
+class _PyIns(ABC):
+    """Base class for instructions in the Python-target intermediate form."""
+    pass
+
+
+@dataclass(frozen=True)
+class _PyAssign(_PyIns):
+    target: str
+    value: str
+
+
+@dataclass(frozen=True)
+class _PyDef(_PyIns):
+    name: str
+    argument: str
+    body: list[_PyIns]
+    result: str
+
+
+@dataclass(frozen=True)
+class _PyIf(_PyIns):
+    test: str
+    result: str
+    then_body: list[_PyIns]
+    then_result: str
+    else_body: list[_PyIns]
+    else_result: str
+
 
 @dataclass(frozen=True)
 class _PyComp:
     result: str
-    instructions: list[str]
+    instructions: list[_PyIns]
 
 
 class _PyCompiler:
-    def __init__(self) -> None:
+    """Lower the expression AST into Python statements in a single namespace.
+
+    A compile result's instructions must run before its result name is read.
+    The environment is copied when a binder extends scope, so shadowing a
+    source name changes only the nested expression's lookup, not its siblings.
+    """
+
+    def __init__(self, javascript: bool = False) -> None:
         self.next_reg = 0
         self.next_arg = 0
+        self.javascript = javascript
 
     def reg_new(self) -> str:
         self.next_reg += 1
@@ -1161,11 +1203,14 @@ class _PyCompiler:
         return f"_a{self.next_arg}"
 
     def compile(self, exp: d0exp, env: dict[dvar, str]) -> _PyComp:
-        ins: list[str] = []
+        # Literals and operators allocate fresh result locals. A variable needs
+        # no instruction because its environment entry already names a local.
+        ins: list[_PyIns] = []
         if isinstance(exp, (D0Eint, D0Ebtf)):
             result = self.reg_new()
-            value = repr(exp.arg1)
-            ins.append(f"{result} = {value}")
+            value = (str(exp.arg1).lower() if self.javascript and isinstance(exp.arg1, bool)
+                     else repr(exp.arg1))
+            ins.append(_PyAssign(result, value))
             return _PyComp(result, ins)
         if isinstance(exp, D0Evar):
             try:
@@ -1176,41 +1221,45 @@ class _PyCompiler:
             return self.compile(exp.arg1, env)
         if isinstance(exp, D0Eop0):
             result = self.reg_new()
-            names = {"list_nil": "[]", "optn_nil": "None"}
+            names = {"list_nil": "[]", "optn_nil": "null" if self.javascript else "None"}
             try:
                 value = names[exp.name]
             except KeyError as exc:
                 raise TypeError(f"unsupported nullary operator: {exp.name}") from exc
-            ins.append(f"{result} = {value}")
+            ins.append(_PyAssign(result, value))
             return _PyComp(result, ins)
         if isinstance(exp, D0Elam):
+            # The generated def is emitted where the lambda expression occurs;
+            # its body uses a fresh parameter name and captures free variables
+            # from the surrounding Python scope.
             fn = self.reg_new()
             arg = self.arg_new()
             body_env = dict(env)
             body_env[exp.arg1] = arg
             body = self.compile(exp.arg2, body_env)
-            ins.append(f"def {fn}({arg}):")
-            ins.extend(_py_indent(body.instructions or ["pass"]))
-            ins.append(f"    return {body.result}")
+            ins.append(_PyDef(fn, arg, body.instructions, body.result))
             return _PyComp(fn, ins)
         if isinstance(exp, D0Efix):
+            # Bind the source-level recursive function name to the generated
+            # function's own name while compiling its body. Python resolves
+            # that reference when the function is called, after def executes.
             fn = self.reg_new()
             arg = self.arg_new()
             body_env = dict(env)
             body_env[exp.arg1] = fn
             body_env[exp.arg2] = arg
             body = self.compile(exp.arg3, body_env)
-            ins.append(f"def {fn}({arg}):")
-            ins.extend(_py_indent(body.instructions or ["pass"]))
-            ins.append(f"    return {body.result}")
+            ins.append(_PyDef(fn, arg, body.instructions, body.result))
             return _PyComp(fn, ins)
         if isinstance(exp, D0Eapp):
+            # Concatenate function instructions before argument instructions,
+            # then emit the call. This preserves left-to-right call-by-value.
             fn = self.compile(exp.arg1, env)
             arg = self.compile(exp.arg2, env)
             result = self.reg_new()
             ins.extend(fn.instructions)
             ins.extend(arg.instructions)
-            ins.append(f"{result} = {fn.result}({arg.result})")
+            ins.append(_PyAssign(result, f"{fn.result}({arg.result})"))
             return _PyComp(result, ins)
         if isinstance(exp, D0Eop1):
             arg = self.compile(exp.arg1, env)
@@ -1227,7 +1276,7 @@ class _PyCompiler:
                 rhs = f"_lambda_{op}({arg.result})"
             else:
                 raise TypeError(f"unsupported unary operator: {op}")
-            ins.append(f"{result} = {rhs}")
+            ins.append(_PyAssign(result, rhs))
             return _PyComp(result, ins)
         if isinstance(exp, D0Eop2):
             left = self.compile(exp.arg1, env)
@@ -1239,32 +1288,41 @@ class _PyCompiler:
             if op == "list_cons":
                 rhs = f"_lambda_list_cons({left.result}, {right.result})"
             elif op in {"+", "-", "*", "/", "<", ">", "<=", ">=", "==", "!="}:
-                pyop = "//" if op == "/" else op
-                rhs = f"({left.result} {pyop} {right.result})"
+                if self.javascript and op == "/":
+                    rhs = f"Math.floor({left.result} / {right.result})"
+                else:
+                    target_op = "//" if op == "/" else op
+                    if self.javascript and op in {"==", "!="}:
+                        target_op += "="
+                    rhs = f"({left.result} {target_op} {right.result})"
             else:
                 raise TypeError(f"unsupported binary operator: {op}")
-            ins.append(f"{result} = {rhs}")
+            ins.append(_PyAssign(result, rhs))
             return _PyComp(result, ins)
         if isinstance(exp, D0Eif0):
+            # Branch code must stay conditional: compiling both blocks into
+            # the surrounding instruction stream would eagerly run both.
+            # Both arms assign the same fresh result local for the join point.
             test = self.compile(exp.arg1, env)
             then = self.compile(exp.arg2, env)
             other = self.compile(exp.arg3, env)
             result = self.reg_new()
             ins.extend(test.instructions)
-            ins.append(f"if {test.result}:")
-            ins.extend(_py_indent(then.instructions or ["pass"]))
-            ins.append(f"    {result} = {then.result}")
-            ins.append("else:")
-            ins.extend(_py_indent(other.instructions or ["pass"]))
-            ins.append(f"    {result} = {other.result}")
+            ins.append(_PyIf(test.result, result, then.instructions, then.result,
+                             other.instructions, other.result))
             return _PyComp(result, ins)
         if isinstance(exp, D0Elet):
+            # A let needs no Python assignment of its own: its value's result
+            # local becomes the source name's binding in the body environment.
             value = self.compile(exp.arg2, env)
             body_env = dict(env)
             body_env[exp.arg1] = value.result
             body = self.compile(exp.arg3, body_env)
             return _PyComp(body.result, value.instructions + body.instructions)
         if isinstance(exp, D0Elets):
+            # Declarations are compiled in order, extending the environment
+            # after each initializer. Thus later declarations can use earlier
+            # ones, but an initializer cannot see its own binding here.
             current_env = dict(env)
             ins = []
             declarations = exp.arg1
@@ -1286,24 +1344,100 @@ class _PyCompiler:
                 ins.extend(value.instructions)
             result = self.reg_new()
             parts = ", ".join(value.result for value in values)
-            if len(values) == 1:
-                parts += ","
-            ins.append(f"{result} = ({parts})")
+            if self.javascript:
+                ins.append(_PyAssign(result, f"_lambda_tuple([{parts}])"))
+            else:
+                if len(values) == 1:
+                    parts += ","
+                ins.append(_PyAssign(result, f"({parts})"))
             return _PyComp(result, ins)
         if isinstance(exp, D0Eproj):
             value = self.compile(exp.arg1, env)
             result = self.reg_new()
             ins.extend(value.instructions)
-            ins.append(f"{result} = {value.result}[{exp.arg2}]")
+            if self.javascript:
+                rhs = f"_lambda_tuple_get({value.result}, {exp.arg2})"
+            else:
+                rhs = f"{value.result}[{exp.arg2}]"
+            ins.append(_PyAssign(result, rhs))
             return _PyComp(result, ins)
         raise TypeError(f"unsupported expression in compiler: {exp!r}")
 
 
-def _py_indent(lines: list[str]) -> list[str]:
-    return ["    " + line if line else "    pass" for line in lines]
+class _JSCompiler(_PyCompiler):
+    """Lower the expression AST to the shared instruction form for JavaScript."""
+
+    def __init__(self) -> None:
+        super().__init__(javascript=True)
+
+
+def _pyins_emit(ins: _PyIns, nind: int, lines: list[str]) -> None:
+    """Append Python source for one instruction at the requested indentation."""
+    pad = " " * nind
+    if isinstance(ins, _PyAssign):
+        lines.append(f"{pad}{ins.target} = {ins.value}")
+        return
+    if isinstance(ins, _PyDef):
+        lines.append(f"{pad}def {ins.name}({ins.argument}):")
+        _pyinslst_emit(ins.body, nind + 4, lines)
+        lines.append(f"{' ' * (nind + 4)}return {ins.result}")
+        return
+    if isinstance(ins, _PyIf):
+        lines.append(f"{pad}if {ins.test}:")
+        _pyinslst_emit(ins.then_body, nind + 4, lines)
+        lines.append(f"{' ' * (nind + 4)}{ins.result} = {ins.then_result}")
+        lines.append(f"{pad}else:")
+        _pyinslst_emit(ins.else_body, nind + 4, lines)
+        lines.append(f"{' ' * (nind + 4)}{ins.result} = {ins.else_result}")
+        return
+    raise TypeError(f"unsupported Python instruction: {ins!r}")
+
+
+def _pyinslst_emit(instructions: list[_PyIns], nind: int, lines: list[str]) -> None:
+    if not instructions:
+        lines.append(" " * nind + "pass")
+        return
+    for ins in instructions:
+        _pyins_emit(ins, nind, lines)
+
+
+def _jsins_emit(ins: _PyIns, nind: int, lines: list[str]) -> None:
+    """Append JavaScript source for one structured instruction."""
+    pad = " " * nind
+    if isinstance(ins, _PyAssign):
+        lines.append(f"{pad}let {ins.target} = {ins.value};")
+        return
+    if isinstance(ins, _PyDef):
+        lines.append(f"{pad}function {ins.name}({ins.argument}) {{")
+        _jsinslst_emit(ins.body, nind + 2, lines)
+        lines.append(f"{' ' * (nind + 2)}return {ins.result};")
+        lines.append(f"{pad}}}")
+        return
+    if isinstance(ins, _PyIf):
+        lines.append(f"{pad}let {ins.result};")
+        lines.append(f"{pad}if ({ins.test}) {{")
+        _jsinslst_emit(ins.then_body, nind + 2, lines)
+        lines.append(f"{' ' * (nind + 2)}{ins.result} = {ins.then_result};")
+        lines.append(f"{pad}}} else {{")
+        _jsinslst_emit(ins.else_body, nind + 2, lines)
+        lines.append(f"{' ' * (nind + 2)}{ins.result} = {ins.else_result};")
+        lines.append(f"{pad}}}")
+        return
+    raise TypeError(f"unsupported JavaScript instruction: {ins!r}")
+
+
+def _jsinslst_emit(instructions: list[_PyIns], nind: int, lines: list[str]) -> None:
+    if not instructions:
+        lines.append(" " * nind + ";")
+        return
+    for ins in instructions:
+        _jsins_emit(ins, nind, lines)
 
 
 _PYTHON_RUNTIME = '''\
+# The emitted program uses Python values for integers, booleans, lists and
+# tuples. Options need a tagged pair so optn_cons(None) remains distinct from
+# optn_nil (None); the private sentinel is created once per generated program.
 def _lambda_list_cons(head, tail):
     if not isinstance(tail, list):
         raise TypeError("list_cons: list tail expected")
@@ -1363,16 +1497,95 @@ _lambda_some_tag = object()
 '''
 
 
+_JAVASCRIPT_RUNTIME = '''\
+const _lambda_some_tag = Symbol("some");
+const _lambda_tuple_tag = Symbol("tuple");
+
+function _lambda_list_cons(head, tail) {
+  if (!Array.isArray(tail)) throw new TypeError("list_cons: list tail expected");
+  return [head, ...tail];
+}
+function _lambda_list_nilq(value) {
+  if (!Array.isArray(value)) throw new TypeError("list_nilq: list expected");
+  return value.length === 0;
+}
+function _lambda_list_head(value) {
+  if (!Array.isArray(value)) throw new TypeError("list_head: list expected");
+  if (!value.length) throw new Error("list_head: nonempty list expected");
+  return value[0];
+}
+function _lambda_list_tail(value) {
+  if (!Array.isArray(value)) throw new TypeError("list_tail: list expected");
+  if (!value.length) throw new Error("list_tail: nonempty list expected");
+  return value.slice(1);
+}
+function _lambda_tuple(items) { return { tag: _lambda_tuple_tag, items }; }
+function _lambda_tuple_get(value, index) {
+  if (!value || value.tag !== _lambda_tuple_tag)
+    throw new TypeError("tuple projection: tuple expected");
+  return value.items[index];
+}
+function _lambda_optn_cons(value) { return { tag: _lambda_some_tag, value }; }
+function _lambda_optn_nilq(value) { return value === null; }
+function _lambda_optn_get(value) {
+  if (value === null || value.tag !== _lambda_some_tag)
+    throw new Error("optn_get: nonempty option expected");
+  return value.value;
+}
+function _lambda_format(value) {
+  if (value === null) return "optn_nil()";
+  if (value && value.tag === _lambda_some_tag)
+    return "optn_cons(" + _lambda_format(value.value) + ")";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) return "[" + value.map(_lambda_format).join(", ") + "]";
+  if (value && value.tag === _lambda_tuple_tag) {
+    const body = value.items.map(_lambda_format).join(", ");
+    return "(" + body + (value.items.length === 1 ? "," : "") + ")";
+  }
+  if (typeof value === "function") return "<lam>";
+  return String(value);
+}
+function _lambda_print(value) { console.log(_lambda_format(value)); return _lambda_tuple([]); }
+'''
+
+
 def d0exp_compile(dexp: d0exp) -> str:
-    """Compile an expression AST to a self-contained Python source string."""
+    """Return a self-contained Python program for an expression AST.
+
+    The generated runtime helpers and main function share a module namespace;
+    _lambda_main keeps expression temporaries local, and the final assignment
+    executes the compiled expression when the returned source is run.
+    """
     compiler = _PyCompiler()
     result = compiler.compile(dexp, {})
     lines = ["def _lambda_main():"]
-    lines.extend(_py_indent(result.instructions or ["pass"]))
+    _pyinslst_emit(result.instructions, 4, lines)
     lines.append(f"    return {result.result}")
     return _PYTHON_RUNTIME + "\n" + "\n".join(lines) + "\n\n_lambda_result = _lambda_main()\n"
 
 
+def d0exp_emit(dexp: d0exp) -> None:
+    """Compile an expression and print its generated Python program."""
+    print(d0exp_compile(dexp), end="")
+
+
+def d0exp_compile_js(dexp: d0exp) -> str:
+    """Return a self-contained JavaScript program for an expression AST."""
+    compiler = _JSCompiler()
+    result = compiler.compile(dexp, {})
+    lines = ["function _lambda_main() {"]
+    _jsinslst_emit(result.instructions, 2, lines)
+    lines.append(f"  return {result.result};")
+    lines.append("}")
+    lines.append("const _lambda_result = _lambda_main();")
+    return _JAVASCRIPT_RUNTIME + "\n" + "\n".join(lines) + "\n"
+
+
+def d0exp_emit_js(dexp: d0exp) -> None:
+    """Compile an expression and print its generated JavaScript program."""
+    print(d0exp_compile_js(dexp), end="")
+
+
 def d0cls_compile(declarations: fnlist[d0cls]) -> str:
-    """Compile sequential top-level declarations; result is their unit body."""
+    """Compile sequential declarations; their overall result is the unit tuple."""
     return d0exp_compile(D0Elets(declarations, D0Etupl(())))

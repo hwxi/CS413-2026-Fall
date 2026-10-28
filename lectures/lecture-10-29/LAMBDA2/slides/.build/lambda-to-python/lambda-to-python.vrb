@@ -1,0 +1,21 @@
+\frametitle{Runtime values and helper calls}
+Generated code uses Python's built-in values where they fit the LAMBDA data
+  model, and helper functions for operations that need checks or special
+  representations.
+  \begin{columns}[T]
+    \column{.48\textwidth}
+    \begin{itemize}
+      \item Integers and booleans use Python \texttt{int} and \texttt{bool}.
+      \item Lists and tuples use Python lists and tuples.
+      \item \texttt{list\_head}, \texttt{list\_tail}, and \texttt{list\_cons}
+        call runtime helpers that check their inputs.
+    \end{itemize}
+    \column{.48\textwidth}
+    \begin{itemize}
+      \item \texttt{optn\_nil} is \texttt{None}; \texttt{optn\_cons(x)} is a
+        tagged pair, so an option containing \texttt{None} stays distinct.
+      \item Source \texttt{/} emits Python \texttt{//} for integer division.
+      \item \texttt{print} formats the value, prints it, and returns unit
+        (\texttt{()}).
+    \end{itemize}
+  \end{columns}
